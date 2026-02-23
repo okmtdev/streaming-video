@@ -1,4 +1,4 @@
-# Audio Merger — ffmpeg.wasm vs Web Audio API 比較アプリ
+# Audio Merger — ffmpeg.wasm vs Web Audio API
 
 ## 目次
 
@@ -120,12 +120,13 @@
 - ブラウザ差異の影響を受けにくい（WASM は標準化済み）
 
 **できないこと・制限**
-- `SharedArrayBuffer` を使用するため COOP/COEP ヘッダが必要
+- マルチスレッド版（`@ffmpeg/core-mt`）を使う場合は `SharedArrayBuffer` が必要なため COOP/COEP ヘッダが必要
   ```
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
   ```
   → CDN からのスクリプトや iframe 埋め込みに制約が生じる
+  ※ このアプリは `@ffmpeg/core`（シングルスレッド版）を使用しているため COOP/COEP ヘッダは不要
 - 初回ロードに約 30MB の WASM ファイルダウンロードが必要
 - メモリ消費が大きい（ファイルを WASM ヒープ + JS 側の両方に持つ）
 - WASM Worker が複数タブで共有されないため、タブが増えるほどメモリが増加
@@ -162,7 +163,7 @@
 ### WASM ロードの仕組み
 
 ```js
-// vite.config.js: COOP/COEP ヘッダの設定
+// vite.config.js: ローカル開発時のヘッダ設定（本番の GCS では不要）
 server: {
   headers: {
     'Cross-Origin-Opener-Policy': 'same-origin',
@@ -171,7 +172,7 @@ server: {
 }
 ```
 
-ffmpeg.wasm は内部で `SharedArrayBuffer` を使用します。`SharedArrayBuffer` はセキュリティ上の理由からクロスオリジン分離環境でのみ有効になるため、上記のヘッダが必須です。
+このアプリは `@ffmpeg/core`（シングルスレッド版）を使用しているため、`SharedArrayBuffer` は不要です。COOP/COEP ヘッダがなくても GCS などの環境で動作します。マルチスレッド版（`@ffmpeg/core-mt`）に切り替えた場合はこれらのヘッダが必須になります。
 
 ```js
 // AudioMerger.vue: WASM ファイルを Blob URL でラップしてロード
@@ -183,7 +184,7 @@ await ffmpeg.load({
 })
 ```
 
-`toBlobURL` は外部 URL からファイルを fetch し、同一オリジンの Blob URL に変換します。これにより COEP 制約を満たしながら、`type: "module"` な Web Worker 内で ESM として動的 `import()` できます。
+`toBlobURL` は外部 URL からファイルを fetch し、同一オリジンの Blob URL に変換します。`type: "module"` な Web Worker 内で ESM として動的 `import()` できます。
 
 > **ESM 版を使う理由**: ffmpeg.wasm の Web Worker は `type: "module"` で動作するため `importScripts()` が使えません。`/umd/` ビルドは `this.createFFmpegCore` をグローバルに設定しますが、ESM スコープでは `this` が `undefined` になり失敗します。`/esm/` ビルドを使うことでこの問題を回避しています。
 
