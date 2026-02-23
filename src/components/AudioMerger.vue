@@ -18,12 +18,14 @@ const file2 = ref(null)
 const file1Name = ref('')
 const file2Name = ref('')
 
-// 複数フォーマット出力に対応するため配列で管理
+const volume1 = ref(100)   // %: 0〜200
+const volume2 = ref(100)
+const silenceSec = ref(0)  // 秒: 0〜10
+
 const mergedOutputs = ref([])
 
 const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm'
 
-// 各フォーマットのエンコード設定
 const CODEC_CONFIG = {
   mp3: { args: ['-acodec', 'libmp3lame', '-b:a', '192k'], mime: 'audio/mpeg', label: 'MP3' },
   wav: { args: ['-acodec', 'pcm_s16le'], mime: 'audio/wav', label: 'WAV' },
@@ -36,9 +38,7 @@ async function loadFFmpeg() {
   try {
     ffmpeg.on('log', ({ message }) => {
       logMessages.value.push(message)
-      if (logMessages.value.length > 50) {
-        logMessages.value.shift()
-      }
+      if (logMessages.value.length > 50) logMessages.value.shift()
     })
     ffmpeg.on('progress', ({ progress: p }) => {
       progress.value = Math.round(p * 100)
@@ -61,18 +61,12 @@ function getExtension(filename) {
 
 function onFile1Change(event) {
   const f = event.target.files[0]
-  if (f) {
-    file1.value = f
-    file1Name.value = f.name
-  }
+  if (f) { file1.value = f; file1Name.value = f.name }
 }
 
 function onFile2Change(event) {
   const f = event.target.files[0]
-  if (f) {
-    file2.value = f
-    file2Name.value = f.name
-  }
+  if (f) { file2.value = f; file2Name.value = f.name }
 }
 
 async function mergeAudio() {
@@ -87,7 +81,6 @@ async function mergeAudio() {
   errorMessage.value = ''
   logMessages.value = []
 
-  // 以前の出力を解放
   for (const o of mergedOutputs.value) URL.revokeObjectURL(o.url)
   mergedOutputs.value = []
 
@@ -96,28 +89,43 @@ async function mergeAudio() {
   try {
     const ext1 = getExtension(file1.value.name)
     const ext2 = getExtension(file2.value.name)
-
-    // 対応フォーマット外の場合は wav にフォールバック
     const fmt1 = CODEC_CONFIG[ext1] ? ext1 : 'wav'
     const fmt2 = CODEC_CONFIG[ext2] ? ext2 : 'wav'
-
-    // 同じ形式なら1つ、異なる形式なら両方を出力
     const outputFormats = fmt1 === fmt2 ? [fmt1] : [fmt1, fmt2]
 
-    // Step 1: 入力ファイルを仮想FSに書き込む
+    // 音量は小数 3 桁で渡す (例: 1.500)
+    const vol1 = (volume1.value / 100).toFixed(3)
+    const vol2 = (volume2.value / 100).toFixed(3)
+    const silence = Math.max(0, Math.min(10, isNaN(silenceSec.value) ? 0 : silenceSec.value))
+
     await ffmpeg.writeFile(`input1.${ext1}`, await fetchFile(file1.value))
     await ffmpeg.writeFile(`input2.${ext2}`, await fetchFile(file2.value))
 
-    // Step 2: 連結のため両ファイルを共通の PCM WAV に変換（44100Hz / 2ch で統一）
-    await ffmpeg.exec(['-i', `input1.${ext1}`, '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', 'tmp1.wav'])
-    await ffmpeg.exec(['-i', `input2.${ext2}`, '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', 'tmp2.wav'])
+    // Step 1: 音量フィルターを適用しながら PCM WAV に変換 (44100Hz / 2ch)
+    await ffmpeg.exec(['-i', `input1.${ext1}`, '-af', `volume=${vol1}`, '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', 'tmp1.wav'])
+    await ffmpeg.exec(['-i', `input2.${ext2}`, '-af', `volume=${vol2}`, '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', 'tmp2.wav'])
 
-    // Step 3: concat demuxer で連結して中間 WAV を生成
-    const concatList = "file 'tmp1.wav'\nfile 'tmp2.wav'\n"
+    // Step 2: 無音ファイルを生成 (anullsrc = 無音を生成する lavfi ソース)
+    if (silence > 0) {
+      await ffmpeg.exec([
+        '-f', 'lavfi',
+        '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+        '-t', String(silence),
+        '-acodec', 'pcm_s16le',
+        'silence.wav',
+      ])
+    }
+
+    // Step 3: concat demuxer 用のリストファイルを作成
+    let concatList = "file 'tmp1.wav'\n"
+    if (silence > 0) concatList += "file 'silence.wav'\n"
+    concatList += "file 'tmp2.wav'\n"
     await ffmpeg.writeFile('filelist.txt', new TextEncoder().encode(concatList))
+
+    // Step 4: 連結して中間 WAV を生成
     await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'filelist.txt', '-acodec', 'pcm_s16le', 'combined.wav'])
 
-    // Step 4: 出力フォーマットごとにエンコードして Blob URL を生成
+    // Step 5: 各出力フォーマットにエンコード
     const newOutputs = []
     for (const fmt of outputFormats) {
       const config = CODEC_CONFIG[fmt]
@@ -133,13 +141,14 @@ async function mergeAudio() {
     }
     mergedOutputs.value = newOutputs
 
-    // Step 5: 仮想FS のクリーンアップ
+    // Step 6: クリーンアップ
     await ffmpeg.deleteFile(`input1.${ext1}`)
     await ffmpeg.deleteFile(`input2.${ext2}`)
     await ffmpeg.deleteFile('tmp1.wav')
     await ffmpeg.deleteFile('tmp2.wav')
     await ffmpeg.deleteFile('filelist.txt')
     await ffmpeg.deleteFile('combined.wav')
+    if (silence > 0) await ffmpeg.deleteFile('silence.wav')
   } catch (e) {
     errorMessage.value = `合成に失敗しました: ${e?.message ?? e}`
   } finally {
@@ -158,7 +167,7 @@ function downloadOutput(output) {
 
 <template>
   <div class="merger">
-    <!-- Load ffmpeg -->
+    <!-- ffmpeg.wasm 読み込み -->
     <div v-if="!loaded" class="load-section">
       <button class="btn btn-primary" :disabled="loading" @click="loadFFmpeg">
         <span v-if="loading" class="spinner"></span>
@@ -167,68 +176,73 @@ function downloadOutput(output) {
       <p class="hint">初回は WASM ファイルのダウンロードに時間がかかります</p>
     </div>
 
-    <!-- Main UI -->
     <div v-else class="main-ui">
-      <!-- File inputs -->
+      <!-- ファイル入力 + 音量 + 無音 -->
       <div class="file-inputs">
+        <!-- ファイル 1 -->
         <div class="file-input-group">
           <label class="file-label">音声ファイル 1</label>
           <div class="file-drop" @click="$refs.input1.click()">
-            <input
-              ref="input1"
-              type="file"
-              accept=".mp3,.wav,.m4a"
-              class="hidden-input"
-              @change="onFile1Change"
-            />
+            <input ref="input1" type="file" accept=".mp3,.wav,.m4a" class="hidden-input" @change="onFile1Change" />
             <div v-if="file1Name" class="file-name">{{ file1Name }}</div>
             <div v-else class="file-placeholder">
               <span class="upload-icon">&#8593;</span>
               <span>mp3 / wav / m4a を選択</span>
             </div>
           </div>
+          <div class="volume-control">
+            <span class="volume-label">音量</span>
+            <input type="range" min="0" max="200" step="1" v-model.number="volume1" class="volume-slider" :disabled="!file1" />
+            <span class="volume-value">{{ volume1 }}%</span>
+          </div>
         </div>
 
-        <div class="concat-icon">+</div>
+        <!-- 中央: + と無音設定 -->
+        <div class="concat-middle">
+          <span class="concat-plus">+</span>
+          <div class="silence-control">
+            <input
+              type="number" min="0" max="10" step="0.1"
+              v-model.number="silenceSec"
+              class="silence-input"
+              placeholder="0"
+            />
+            <span class="silence-unit">秒の無音</span>
+          </div>
+        </div>
 
+        <!-- ファイル 2 -->
         <div class="file-input-group">
           <label class="file-label">音声ファイル 2</label>
           <div class="file-drop" @click="$refs.input2.click()">
-            <input
-              ref="input2"
-              type="file"
-              accept=".mp3,.wav,.m4a"
-              class="hidden-input"
-              @change="onFile2Change"
-            />
+            <input ref="input2" type="file" accept=".mp3,.wav,.m4a" class="hidden-input" @change="onFile2Change" />
             <div v-if="file2Name" class="file-name">{{ file2Name }}</div>
             <div v-else class="file-placeholder">
               <span class="upload-icon">&#8593;</span>
               <span>mp3 / wav / m4a を選択</span>
             </div>
           </div>
+          <div class="volume-control">
+            <span class="volume-label">音量</span>
+            <input type="range" min="0" max="200" step="1" v-model.number="volume2" class="volume-slider" :disabled="!file2" />
+            <span class="volume-value">{{ volume2 }}%</span>
+          </div>
         </div>
       </div>
 
-      <!-- Merge button -->
-      <button
-        class="btn btn-primary merge-btn"
-        :disabled="merging || !file1 || !file2"
-        @click="mergeAudio"
-      >
+      <!-- 合成ボタン -->
+      <button class="btn btn-primary merge-btn" :disabled="merging || !file1 || !file2" @click="mergeAudio">
         <span v-if="merging" class="spinner"></span>
         {{ merging ? '合成中...' : '音声を合成する' }}
       </button>
 
-      <!-- Progress -->
+      <!-- プログレス -->
       <div v-if="merging" class="progress-section">
-        <div class="progress-bar">
-          <div class="progress-fill" :style="{ width: progress + '%' }"></div>
-        </div>
+        <div class="progress-bar"><div class="progress-fill" :style="{ width: progress + '%' }"></div></div>
         <span class="progress-text">{{ progress }}%</span>
       </div>
 
-      <!-- Result -->
+      <!-- 結果 -->
       <div v-if="mergedOutputs.length > 0" class="result-section">
         <div class="result-header">
           <h3>合成結果</h3>
@@ -240,7 +254,7 @@ function downloadOutput(output) {
           class="output-item"
           :class="{ 'output-item--multi': mergedOutputs.length > 1 }"
         >
-          <span v-if="mergedOutputs.length > 1" class="format-label">{{ output.label }}</span>
+          <span class="format-label">{{ output.label }}</span>
           <audio controls :src="output.url" class="audio-player"></audio>
           <button class="btn btn-secondary" @click="downloadOutput(output)">
             ダウンロード ({{ output.filename }})
@@ -248,17 +262,15 @@ function downloadOutput(output) {
         </div>
       </div>
 
-      <!-- Log -->
+      <!-- ログ -->
       <details v-if="logMessages.length > 0" class="log-section">
         <summary>ffmpeg ログ</summary>
         <pre class="log-content"><code>{{ logMessages.join('\n') }}</code></pre>
       </details>
     </div>
 
-    <!-- Error -->
-    <div v-if="errorMessage" class="error">
-      {{ errorMessage }}
-    </div>
+    <!-- エラー -->
+    <div v-if="errorMessage" class="error">{{ errorMessage }}</div>
   </div>
 </template>
 
@@ -293,54 +305,32 @@ function downloadOutput(output) {
   cursor: pointer;
   transition: background-color 0.2s, opacity 0.2s;
 }
-
-.btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.btn-primary {
-  background-color: #0071e3;
-  color: #fff;
-}
-
-.btn-primary:hover:not(:disabled) {
-  background-color: #0077ed;
-}
-
-.btn-secondary {
-  background-color: #e8e8ed;
-  color: #1d1d1f;
-}
-
-.btn-secondary:hover:not(:disabled) {
-  background-color: #d2d2d7;
-}
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-primary { background-color: #0071e3; color: #fff; }
+.btn-primary:hover:not(:disabled) { background-color: #0077ed; }
+.btn-secondary { background-color: #e8e8ed; color: #1d1d1f; }
+.btn-secondary:hover:not(:disabled) { background-color: #d2d2d7; }
 
 .spinner {
   display: inline-block;
   width: 16px;
   height: 16px;
-  border: 2px solid rgba(255, 255, 255, 0.3);
+  border: 2px solid rgba(255,255,255,0.3);
   border-top-color: #fff;
   border-radius: 50%;
   animation: spin 0.6s linear infinite;
 }
+@keyframes spin { to { transform: rotate(360deg); } }
 
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
+/* ── ファイル入力エリア ── */
 .file-inputs {
   display: flex;
-  align-items: center;
-  gap: 16px;
+  align-items: flex-start;
+  gap: 12px;
   margin-bottom: 24px;
 }
 
-.file-input-group {
-  flex: 1;
-}
+.file-input-group { flex: 1; }
 
 .file-label {
   display: block;
@@ -358,22 +348,10 @@ function downloadOutput(output) {
   cursor: pointer;
   transition: border-color 0.2s, background-color 0.2s;
 }
+.file-drop:hover { border-color: #0071e3; background-color: #f0f5ff; }
 
-.file-drop:hover {
-  border-color: #0071e3;
-  background-color: #f0f5ff;
-}
-
-.hidden-input {
-  display: none;
-}
-
-.file-name {
-  font-weight: 500;
-  color: #1d1d1f;
-  word-break: break-all;
-}
-
+.hidden-input { display: none; }
+.file-name { font-weight: 500; color: #1d1d1f; word-break: break-all; }
 .file-placeholder {
   display: flex;
   flex-direction: column;
@@ -382,154 +360,120 @@ function downloadOutput(output) {
   color: #86868b;
   font-size: 0.9rem;
 }
+.upload-icon { font-size: 1.5rem; font-weight: bold; }
 
-.upload-icon {
-  font-size: 1.5rem;
-  font-weight: bold;
+/* ── 音量スライダー ── */
+.volume-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 0 2px;
+}
+.volume-label {
+  font-size: 0.78rem;
+  color: #86868b;
+  white-space: nowrap;
+}
+.volume-slider {
+  flex: 1;
+  accent-color: #0071e3;
+  cursor: pointer;
+}
+.volume-slider:disabled { opacity: 0.35; cursor: not-allowed; }
+.volume-value {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #1d1d1f;
+  min-width: 38px;
+  text-align: right;
 }
 
-.concat-icon {
+/* ── 中央: + と無音設定 ── */
+.concat-middle {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding-top: 30px;
+  flex-shrink: 0;
+}
+.concat-plus {
   font-size: 2rem;
   font-weight: 700;
   color: #86868b;
-  padding-top: 24px;
+}
+.silence-control {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+}
+.silence-input {
+  width: 60px;
+  text-align: center;
+  padding: 5px 6px;
+  border: 1.5px solid #d2d2d7;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  color: #1d1d1f;
+  outline: none;
+  transition: border-color 0.2s;
+}
+.silence-input:focus { border-color: #0071e3; }
+.silence-unit {
+  font-size: 0.74rem;
+  color: #86868b;
+  white-space: nowrap;
 }
 
+/* ── 合成ボタン ── */
 .merge-btn {
   display: block;
   width: 100%;
-  text-align: center;
   justify-content: center;
 }
 
-.progress-section {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-top: 16px;
-}
+/* ── プログレス ── */
+.progress-section { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+.progress-bar { flex: 1; height: 8px; background: #e8e8ed; border-radius: 4px; overflow: hidden; }
+.progress-fill { height: 100%; background: #0071e3; border-radius: 4px; transition: width 0.3s ease; }
+.progress-text { font-size: 0.85rem; font-weight: 600; color: #6e6e73; min-width: 40px; }
 
-.progress-bar {
-  flex: 1;
-  height: 8px;
-  background: #e8e8ed;
-  border-radius: 4px;
-  overflow: hidden;
-}
-
-.progress-fill {
-  height: 100%;
-  background: #0071e3;
-  border-radius: 4px;
-  transition: width 0.3s ease;
-}
-
-.progress-text {
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: #6e6e73;
-  min-width: 40px;
-}
-
-.result-section {
-  margin-top: 24px;
-  padding: 20px;
-  background: #f5f5f7;
-  border-radius: 12px;
-}
-
-.result-header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 16px;
-}
-
-.result-header h3 {
-  font-size: 1rem;
-  margin: 0;
-}
-
+/* ── 結果 ── */
+.result-section { margin-top: 24px; padding: 20px; background: #f5f5f7; border-radius: 12px; }
+.result-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.result-header h3 { font-size: 1rem; margin: 0; }
 .time-badge {
-  font-size: 0.8rem;
-  font-weight: 600;
-  color: #fff;
-  background: #0071e3;
-  padding: 3px 10px;
-  border-radius: 20px;
+  font-size: 0.8rem; font-weight: 600; color: #fff;
+  background: #0071e3; padding: 3px 10px; border-radius: 20px;
 }
-
-.output-item {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.output-item--multi {
-  padding: 14px;
-  background: #fff;
-  border-radius: 10px;
-  margin-bottom: 10px;
-}
-
-.output-item--multi:last-child {
-  margin-bottom: 0;
-}
-
+.output-item { display: flex; flex-direction: column; gap: 10px; }
+.output-item--multi { padding: 14px; background: #fff; border-radius: 10px; margin-bottom: 10px; }
+.output-item--multi:last-child { margin-bottom: 0; }
 .format-label {
-  font-size: 0.78rem;
-  font-weight: 700;
-  color: #0071e3;
-  background: #e8f0fe;
-  padding: 2px 10px;
-  border-radius: 20px;
-  align-self: flex-start;
+  font-size: 0.78rem; font-weight: 700; color: #0071e3;
+  background: #e8f0fe; padding: 2px 10px; border-radius: 20px; align-self: flex-start;
 }
+.audio-player { width: 100%; }
 
-.audio-player {
-  width: 100%;
-}
-
-.log-section {
-  margin-top: 20px;
-}
-
-.log-section summary {
-  cursor: pointer;
-  font-size: 0.85rem;
-  color: #6e6e73;
-  font-weight: 600;
-}
-
+/* ── ログ ── */
+.log-section { margin-top: 20px; }
+.log-section summary { cursor: pointer; font-size: 0.85rem; color: #6e6e73; font-weight: 600; }
 .log-content {
-  margin-top: 8px;
-  padding: 12px;
-  background: #1d1d1f;
-  color: #a1ffa1;
-  border-radius: 8px;
-  font-size: 0.75rem;
-  max-height: 200px;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-all;
+  margin-top: 8px; padding: 12px; background: #1d1d1f; color: #a1ffa1;
+  border-radius: 8px; font-size: 0.75rem; max-height: 200px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-all;
 }
 
+/* ── エラー ── */
 .error {
-  margin-top: 16px;
-  padding: 12px 16px;
-  background: #fff2f2;
-  color: #d70015;
-  border-radius: 10px;
-  font-size: 0.9rem;
-  font-weight: 500;
+  margin-top: 16px; padding: 12px 16px; background: #fff2f2;
+  color: #d70015; border-radius: 10px; font-size: 0.9rem; font-weight: 500;
 }
 
 @media (max-width: 600px) {
-  .file-inputs {
-    flex-direction: column;
-  }
-  .concat-icon {
-    padding-top: 0;
-  }
+  .file-inputs { flex-direction: column; }
+  .concat-middle { flex-direction: row; padding-top: 0; gap: 12px; }
 }
 </style>
