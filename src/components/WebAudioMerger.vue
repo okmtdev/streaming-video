@@ -1,0 +1,588 @@
+<script setup>
+import { ref, computed } from 'vue'
+import { Mp3Encoder } from '@breezystack/lamejs'
+import { Muxer, ArrayBufferTarget } from 'mp4-muxer'
+
+const merging = ref(false)
+const mergeTime = ref(null)
+const errorMessage = ref('')
+
+const file1 = ref(null)
+const file2 = ref(null)
+const file1Name = ref('')
+const file2Name = ref('')
+
+const mergedOutputs = ref([])
+
+// 出力フォーマット情報
+const CODEC_CONFIG = {
+  mp3: { mime: 'audio/mpeg', label: 'MP3' },
+  wav: { mime: 'audio/wav', label: 'WAV' },
+  m4a: { mime: 'audio/mp4', label: 'M4A' },
+}
+
+function getExtension(filename) {
+  return filename.split('.').pop().toLowerCase()
+}
+
+function onFile1Change(event) {
+  const f = event.target.files[0]
+  if (f) { file1.value = f; file1Name.value = f.name }
+}
+
+function onFile2Change(event) {
+  const f = event.target.files[0]
+  if (f) { file2.value = f; file2Name.value = f.name }
+}
+
+// M4A 入力が含まれるときに WebCodecs 対応注意を表示するために使用
+const hasM4aInput = computed(() => {
+  const ext1 = file1.value ? getExtension(file1.value.name) : ''
+  const ext2 = file2.value ? getExtension(file2.value.name) : ''
+  return ext1 === 'm4a' || ext2 === 'm4a'
+})
+
+// ── エンコーダー ──────────────────────────────────────────
+
+// WAV: 自前で PCM ヘッダを書き込む
+function encodeWAV(audioBuffer) {
+  const numChannels = audioBuffer.numberOfChannels
+  const sampleRate = audioBuffer.sampleRate
+  const numSamples = audioBuffer.length
+  const bytesPerSample = 2
+  const dataSize = numSamples * numChannels * bytesPerSample
+  const buffer = new ArrayBuffer(44 + dataSize)
+  const view = new DataView(buffer)
+
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i))
+  }
+
+  writeString(0, 'RIFF')
+  view.setUint32(4, 36 + dataSize, true)
+  writeString(8, 'WAVE')
+  writeString(12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, numChannels, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * numChannels * bytesPerSample, true)
+  view.setUint16(32, numChannels * bytesPerSample, true)
+  view.setUint16(34, 16, true)
+  writeString(36, 'data')
+  view.setUint32(40, dataSize, true)
+
+  let offset = 44
+  for (let i = 0; i < numSamples; i++) {
+    for (let ch = 0; ch < numChannels; ch++) {
+      const s = Math.max(-1, Math.min(1, audioBuffer.getChannelData(ch)[i]))
+      view.setInt16(offset, Math.round(s * (s < 0 ? 0x8000 : 0x7fff)), true)
+      offset += 2
+    }
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' })
+}
+
+// MP3: lamejs を使って Float32 PCM → MP3 バイト列に変換
+function encodeMp3(audioBuffer) {
+  const numChannels = audioBuffer.numberOfChannels
+  const sampleRate = audioBuffer.sampleRate
+  const numSamples = audioBuffer.length
+
+  const encoder = new Mp3Encoder(numChannels, sampleRate, 192)
+  const mp3Chunks = []
+
+  // Float32 → Int16 変換
+  const left = new Int16Array(numSamples)
+  const right = numChannels > 1 ? new Int16Array(numSamples) : null
+
+  const leftData = audioBuffer.getChannelData(0)
+  for (let i = 0; i < numSamples; i++) {
+    left[i] = Math.round(Math.max(-1, Math.min(1, leftData[i])) * 0x7fff)
+  }
+  if (right) {
+    const rightData = audioBuffer.getChannelData(1)
+    for (let i = 0; i < numSamples; i++) {
+      right[i] = Math.round(Math.max(-1, Math.min(1, rightData[i])) * 0x7fff)
+    }
+  }
+
+  // MP3 フレームサイズ (1152 サンプル) 単位でエンコード
+  const BLOCK_SIZE = 1152
+  for (let i = 0; i < numSamples; i += BLOCK_SIZE) {
+    const leftBlock = left.subarray(i, i + BLOCK_SIZE)
+    const rightBlock = right ? right.subarray(i, i + BLOCK_SIZE) : null
+    const chunk = right
+      ? encoder.encodeBuffer(leftBlock, rightBlock)
+      : encoder.encodeBuffer(leftBlock)
+    if (chunk.length > 0) mp3Chunks.push(chunk)
+  }
+
+  const finalChunk = encoder.flush()
+  if (finalChunk.length > 0) mp3Chunks.push(finalChunk)
+
+  return new Blob(mp3Chunks, { type: 'audio/mpeg' })
+}
+
+// M4A: WebCodecs API (AudioEncoder) + mp4-muxer で AAC → MP4 コンテナに格納
+async function encodeM4a(audioBuffer) {
+  if (typeof AudioEncoder === 'undefined') {
+    throw new Error('このブラウザは WebCodecs API (AudioEncoder) に未対応です')
+  }
+
+  const { numberOfChannels, sampleRate } = audioBuffer
+
+  const target = new ArrayBufferTarget()
+  const muxer = new Muxer({
+    target,
+    audio: { codec: 'aac', numberOfChannels, sampleRate },
+    fastStart: 'in-memory',
+  })
+
+  await new Promise((resolve, reject) => {
+    let encoder
+    try {
+      encoder = new AudioEncoder({
+        output: (chunk, metadata) => {
+          try { muxer.addAudioChunk(chunk, metadata) } catch (e) { reject(e) }
+        },
+        error: reject,
+      })
+
+      encoder.configure({
+        codec: 'mp4a.40.2', // AAC-LC
+        numberOfChannels,
+        sampleRate,
+        bitrate: 192_000,
+      })
+
+      // AudioBuffer は非インターリーブなので、AAC フレーム単位 (1024) でインターリーブ変換して渡す
+      const FRAME_SIZE = 1024
+      for (let i = 0; i < audioBuffer.length; i += FRAME_SIZE) {
+        const frameLength = Math.min(FRAME_SIZE, audioBuffer.length - i)
+        const frameData = new Float32Array(frameLength * numberOfChannels)
+        for (let ch = 0; ch < numberOfChannels; ch++) {
+          const channelData = audioBuffer.getChannelData(ch)
+          for (let j = 0; j < frameLength; j++) {
+            frameData[j * numberOfChannels + ch] = channelData[i + j]
+          }
+        }
+
+        const audioData = new AudioData({
+          format: 'f32-interleaved',
+          sampleRate,
+          numberOfFrames: frameLength,
+          numberOfChannels,
+          timestamp: Math.round((i / sampleRate) * 1_000_000), // microseconds
+          data: frameData,
+        })
+        encoder.encode(audioData)
+        audioData.close()
+      }
+
+      encoder.flush().then(() => { encoder.close(); resolve() }).catch(reject)
+    } catch (e) {
+      reject(e)
+    }
+  })
+
+  muxer.finalize()
+  return new Blob([target.buffer], { type: 'audio/mp4' })
+}
+
+// フォーマット別ディスパッチ
+async function encodeToFormat(fmt, audioBuffer) {
+  switch (fmt) {
+    case 'wav': return encodeWAV(audioBuffer)
+    case 'mp3': return encodeMp3(audioBuffer)
+    case 'm4a': return encodeM4a(audioBuffer)
+  }
+}
+
+// ── メイン処理 ─────────────────────────────────────────────
+
+async function mergeAudio() {
+  if (!file1.value || !file2.value) {
+    errorMessage.value = '2つの音声ファイルを選択してください'
+    return
+  }
+
+  merging.value = true
+  mergeTime.value = null
+  errorMessage.value = ''
+
+  for (const o of mergedOutputs.value) URL.revokeObjectURL(o.url)
+  mergedOutputs.value = []
+
+  const startTime = performance.now()
+
+  try {
+    const ext1 = getExtension(file1.value.name)
+    const ext2 = getExtension(file2.value.name)
+    const fmt1 = CODEC_CONFIG[ext1] ? ext1 : 'wav'
+    const fmt2 = CODEC_CONFIG[ext2] ? ext2 : 'wav'
+    const outputFormats = fmt1 === fmt2 ? [fmt1] : [fmt1, fmt2]
+
+    const audioCtx = new AudioContext()
+
+    // 並列でデコード（decodeAudioData は AudioContext のサンプルレートに揃える）
+    const [ab1, ab2] = await Promise.all([
+      file1.value.arrayBuffer(),
+      file2.value.arrayBuffer(),
+    ])
+    const [buf1, buf2] = await Promise.all([
+      audioCtx.decodeAudioData(ab1),
+      audioCtx.decodeAudioData(ab2),
+    ])
+
+    // チャンネル数は多い方に、モノラル→ステレオは同チャンネルを複製
+    const numChannels = Math.max(buf1.numberOfChannels, buf2.numberOfChannels)
+    const sampleRate = audioCtx.sampleRate
+
+    const merged = audioCtx.createBuffer(numChannels, buf1.length + buf2.length, sampleRate)
+    for (let ch = 0; ch < numChannels; ch++) {
+      const out = merged.getChannelData(ch)
+      out.set(buf1.getChannelData(Math.min(ch, buf1.numberOfChannels - 1)), 0)
+      out.set(buf2.getChannelData(Math.min(ch, buf2.numberOfChannels - 1)), buf1.length)
+    }
+
+    audioCtx.close()
+
+    // 各フォーマットにエンコード
+    const newOutputs = []
+    for (const fmt of outputFormats) {
+      const config = CODEC_CONFIG[fmt]
+      const blob = await encodeToFormat(fmt, merged)
+      newOutputs.push({
+        url: URL.createObjectURL(blob),
+        filename: `output.${fmt}`,
+        label: config.label,
+      })
+    }
+    mergedOutputs.value = newOutputs
+  } catch (e) {
+    errorMessage.value = `合成に失敗しました: ${e?.message ?? e}`
+  } finally {
+    mergeTime.value = ((performance.now() - startTime) / 1000).toFixed(2)
+    merging.value = false
+  }
+}
+
+function downloadOutput(output) {
+  const a = document.createElement('a')
+  a.href = output.url
+  a.download = output.filename
+  a.click()
+}
+</script>
+
+<template>
+  <div class="merger">
+    <div class="main-ui">
+      <!-- File inputs -->
+      <div class="file-inputs">
+        <div class="file-input-group">
+          <label class="file-label">音声ファイル 1</label>
+          <div class="file-drop" @click="$refs.input1.click()">
+            <input
+              ref="input1"
+              type="file"
+              accept=".mp3,.wav,.m4a"
+              class="hidden-input"
+              @change="onFile1Change"
+            />
+            <div v-if="file1Name" class="file-name">{{ file1Name }}</div>
+            <div v-else class="file-placeholder">
+              <span class="upload-icon">&#8593;</span>
+              <span>mp3 / wav / m4a を選択</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="concat-icon">+</div>
+
+        <div class="file-input-group">
+          <label class="file-label">音声ファイル 2</label>
+          <div class="file-drop" @click="$refs.input2.click()">
+            <input
+              ref="input2"
+              type="file"
+              accept=".mp3,.wav,.m4a"
+              class="hidden-input"
+              @change="onFile2Change"
+            />
+            <div v-if="file2Name" class="file-name">{{ file2Name }}</div>
+            <div v-else class="file-placeholder">
+              <span class="upload-icon">&#8593;</span>
+              <span>mp3 / wav / m4a を選択</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- M4A 利用時の WebCodecs 注意 -->
+      <p v-if="hasM4aInput" class="m4a-note">
+        M4A エンコードには WebCodecs API が必要です
+        <span class="m4a-note-browsers">（Chrome 94+ / Firefox 130+ / Safari 16.4+）</span>
+      </p>
+
+      <!-- Merge button -->
+      <button
+        class="btn btn-primary merge-btn"
+        :disabled="merging || !file1 || !file2"
+        @click="mergeAudio"
+      >
+        <span v-if="merging" class="spinner"></span>
+        {{ merging ? '合成中...' : '音声を合成する' }}
+      </button>
+
+      <!-- Result -->
+      <div v-if="mergedOutputs.length > 0" class="result-section">
+        <div class="result-header">
+          <h3>合成結果</h3>
+          <span v-if="mergeTime !== null" class="time-badge">処理時間: {{ mergeTime }} 秒</span>
+        </div>
+        <div
+          v-for="output in mergedOutputs"
+          :key="output.filename"
+          class="output-item"
+          :class="{ 'output-item--multi': mergedOutputs.length > 1 }"
+        >
+          <span class="format-label">{{ output.label }}</span>
+          <audio controls :src="output.url" class="audio-player"></audio>
+          <button class="btn btn-secondary" @click="downloadOutput(output)">
+            ダウンロード ({{ output.filename }})
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Error -->
+    <div v-if="errorMessage" class="error">
+      {{ errorMessage }}
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.merger {
+  background: #fff;
+  border-radius: 16px;
+  padding: 32px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 24px;
+  border: none;
+  border-radius: 10px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s, opacity 0.2s;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background-color: #28a745;
+  color: #fff;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background-color: #2db84d;
+}
+
+.btn-secondary {
+  background-color: #e8e8ed;
+  color: #1d1d1f;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background-color: #d2d2d7;
+}
+
+.spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.file-inputs {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.file-input-group {
+  flex: 1;
+}
+
+.file-label {
+  display: block;
+  font-weight: 600;
+  font-size: 0.9rem;
+  margin-bottom: 8px;
+  color: #1d1d1f;
+}
+
+.file-drop {
+  border: 2px dashed #d2d2d7;
+  border-radius: 12px;
+  padding: 24px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background-color 0.2s;
+}
+
+.file-drop:hover {
+  border-color: #28a745;
+  background-color: #f0fff4;
+}
+
+.hidden-input {
+  display: none;
+}
+
+.file-name {
+  font-weight: 500;
+  color: #1d1d1f;
+  word-break: break-all;
+}
+
+.file-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  color: #86868b;
+  font-size: 0.9rem;
+}
+
+.upload-icon {
+  font-size: 1.5rem;
+  font-weight: bold;
+}
+
+.concat-icon {
+  font-size: 2rem;
+  font-weight: 700;
+  color: #86868b;
+  padding-top: 24px;
+}
+
+.m4a-note {
+  margin-bottom: 16px;
+  padding: 8px 12px;
+  background: #fffbe6;
+  border: 1px solid #ffe58f;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  color: #7a5c00;
+}
+
+.m4a-note-browsers {
+  opacity: 0.75;
+}
+
+.merge-btn {
+  display: block;
+  width: 100%;
+  text-align: center;
+  justify-content: center;
+}
+
+.result-section {
+  margin-top: 24px;
+  padding: 20px;
+  background: #f5f5f7;
+  border-radius: 12px;
+}
+
+.result-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.result-header h3 {
+  font-size: 1rem;
+  margin: 0;
+}
+
+.time-badge {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #fff;
+  background: #28a745;
+  padding: 3px 10px;
+  border-radius: 20px;
+}
+
+.output-item {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.output-item--multi {
+  padding: 14px;
+  background: #fff;
+  border-radius: 10px;
+  margin-bottom: 10px;
+}
+
+.output-item--multi:last-child {
+  margin-bottom: 0;
+}
+
+.format-label {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #28a745;
+  background: #e6f9ec;
+  padding: 2px 10px;
+  border-radius: 20px;
+  align-self: flex-start;
+}
+
+.audio-player {
+  width: 100%;
+}
+
+.error {
+  margin-top: 16px;
+  padding: 12px 16px;
+  background: #fff2f2;
+  color: #d70015;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+
+@media (max-width: 600px) {
+  .file-inputs {
+    flex-direction: column;
+  }
+  .concat-icon {
+    padding-top: 0;
+  }
+}
+</style>

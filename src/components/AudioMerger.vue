@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref } from 'vue'
 import { FFmpeg } from '@ffmpeg/ffmpeg'
 import { fetchFile, toBlobURL } from '@ffmpeg/util'
 
@@ -11,16 +11,24 @@ const merging = ref(false)
 const progress = ref(0)
 const logMessages = ref([])
 const errorMessage = ref('')
+const mergeTime = ref(null)
 
 const file1 = ref(null)
 const file2 = ref(null)
 const file1Name = ref('')
 const file2Name = ref('')
 
-const mergedAudioUrl = ref('')
-const mergedFileName = ref('')
+// 複数フォーマット出力に対応するため配列で管理
+const mergedOutputs = ref([])
 
-const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd'
+const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm'
+
+// 各フォーマットのエンコード設定
+const CODEC_CONFIG = {
+  mp3: { args: ['-acodec', 'libmp3lame', '-b:a', '192k'], mime: 'audio/mpeg', label: 'MP3' },
+  wav: { args: ['-acodec', 'pcm_s16le'], mime: 'audio/wav', label: 'WAV' },
+  m4a: { args: ['-acodec', 'aac', '-b:a', '192k'], mime: 'audio/mp4', label: 'M4A' },
+}
 
 async function loadFFmpeg() {
   loading.value = true
@@ -41,7 +49,7 @@ async function loadFFmpeg() {
     })
     loaded.value = true
   } catch (e) {
-    errorMessage.value = `ffmpeg.wasm の読み込みに失敗しました: ${e.message}`
+    errorMessage.value = `ffmpeg.wasm の読み込みに失敗しました: ${e?.message ?? e}`
   } finally {
     loading.value = false
   }
@@ -75,67 +83,75 @@ async function mergeAudio() {
 
   merging.value = true
   progress.value = 0
+  mergeTime.value = null
   errorMessage.value = ''
   logMessages.value = []
 
-  if (mergedAudioUrl.value) {
-    URL.revokeObjectURL(mergedAudioUrl.value)
-    mergedAudioUrl.value = ''
-  }
+  // 以前の出力を解放
+  for (const o of mergedOutputs.value) URL.revokeObjectURL(o.url)
+  mergedOutputs.value = []
+
+  const startTime = performance.now()
 
   try {
     const ext1 = getExtension(file1.value.name)
     const ext2 = getExtension(file2.value.name)
-    const inputFile1 = `input1.${ext1}`
-    const inputFile2 = `input2.${ext2}`
-    const outputFile = 'output.mp3'
 
-    await ffmpeg.writeFile(inputFile1, await fetchFile(file1.value))
-    await ffmpeg.writeFile(inputFile2, await fetchFile(file2.value))
+    // 対応フォーマット外の場合は wav にフォールバック
+    const fmt1 = CODEC_CONFIG[ext1] ? ext1 : 'wav'
+    const fmt2 = CODEC_CONFIG[ext2] ? ext2 : 'wav'
 
-    // Create a concat list file for ffmpeg
-    // First convert both inputs to a common format (PCM WAV) then concatenate
-    await ffmpeg.exec(['-i', inputFile1, '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', 'tmp1.wav'])
-    await ffmpeg.exec(['-i', inputFile2, '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', 'tmp2.wav'])
+    // 同じ形式なら1つ、異なる形式なら両方を出力
+    const outputFormats = fmt1 === fmt2 ? [fmt1] : [fmt1, fmt2]
 
-    // Create concat file list
+    // Step 1: 入力ファイルを仮想FSに書き込む
+    await ffmpeg.writeFile(`input1.${ext1}`, await fetchFile(file1.value))
+    await ffmpeg.writeFile(`input2.${ext2}`, await fetchFile(file2.value))
+
+    // Step 2: 連結のため両ファイルを共通の PCM WAV に変換（44100Hz / 2ch で統一）
+    await ffmpeg.exec(['-i', `input1.${ext1}`, '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', 'tmp1.wav'])
+    await ffmpeg.exec(['-i', `input2.${ext2}`, '-acodec', 'pcm_s16le', '-ar', '44100', '-ac', '2', 'tmp2.wav'])
+
+    // Step 3: concat demuxer で連結して中間 WAV を生成
     const concatList = "file 'tmp1.wav'\nfile 'tmp2.wav'\n"
     await ffmpeg.writeFile('filelist.txt', new TextEncoder().encode(concatList))
+    await ffmpeg.exec(['-f', 'concat', '-safe', '0', '-i', 'filelist.txt', '-acodec', 'pcm_s16le', 'combined.wav'])
 
-    // Concatenate using concat demuxer and encode to mp3
-    await ffmpeg.exec([
-      '-f', 'concat',
-      '-safe', '0',
-      '-i', 'filelist.txt',
-      '-acodec', 'libmp3lame',
-      '-b:a', '192k',
-      outputFile,
-    ])
+    // Step 4: 出力フォーマットごとにエンコードして Blob URL を生成
+    const newOutputs = []
+    for (const fmt of outputFormats) {
+      const config = CODEC_CONFIG[fmt]
+      const outputFile = `output.${fmt}`
+      await ffmpeg.exec(['-i', 'combined.wav', ...config.args, outputFile])
+      const data = await ffmpeg.readFile(outputFile)
+      newOutputs.push({
+        url: URL.createObjectURL(new Blob([data.buffer], { type: config.mime })),
+        filename: outputFile,
+        label: config.label,
+      })
+      await ffmpeg.deleteFile(outputFile)
+    }
+    mergedOutputs.value = newOutputs
 
-    const data = await ffmpeg.readFile(outputFile)
-    const blob = new Blob([data.buffer], { type: 'audio/mpeg' })
-    mergedAudioUrl.value = URL.createObjectURL(blob)
-    mergedFileName.value = outputFile
-
-    // Clean up temporary files in ffmpeg FS
-    await ffmpeg.deleteFile(inputFile1)
-    await ffmpeg.deleteFile(inputFile2)
+    // Step 5: 仮想FS のクリーンアップ
+    await ffmpeg.deleteFile(`input1.${ext1}`)
+    await ffmpeg.deleteFile(`input2.${ext2}`)
     await ffmpeg.deleteFile('tmp1.wav')
     await ffmpeg.deleteFile('tmp2.wav')
     await ffmpeg.deleteFile('filelist.txt')
-    await ffmpeg.deleteFile(outputFile)
+    await ffmpeg.deleteFile('combined.wav')
   } catch (e) {
-    errorMessage.value = `合成に失敗しました: ${e.message}`
+    errorMessage.value = `合成に失敗しました: ${e?.message ?? e}`
   } finally {
+    mergeTime.value = ((performance.now() - startTime) / 1000).toFixed(2)
     merging.value = false
   }
 }
 
-function downloadMerged() {
-  if (!mergedAudioUrl.value) return
+function downloadOutput(output) {
   const a = document.createElement('a')
-  a.href = mergedAudioUrl.value
-  a.download = mergedFileName.value
+  a.href = output.url
+  a.download = output.filename
   a.click()
 }
 </script>
@@ -161,14 +177,14 @@ function downloadMerged() {
             <input
               ref="input1"
               type="file"
-              accept=".mp3,.wav"
+              accept=".mp3,.wav,.m4a"
               class="hidden-input"
               @change="onFile1Change"
             />
             <div v-if="file1Name" class="file-name">{{ file1Name }}</div>
             <div v-else class="file-placeholder">
               <span class="upload-icon">&#8593;</span>
-              <span>mp3 / wav ファイルを選択</span>
+              <span>mp3 / wav / m4a を選択</span>
             </div>
           </div>
         </div>
@@ -181,14 +197,14 @@ function downloadMerged() {
             <input
               ref="input2"
               type="file"
-              accept=".mp3,.wav"
+              accept=".mp3,.wav,.m4a"
               class="hidden-input"
               @change="onFile2Change"
             />
             <div v-if="file2Name" class="file-name">{{ file2Name }}</div>
             <div v-else class="file-placeholder">
               <span class="upload-icon">&#8593;</span>
-              <span>mp3 / wav ファイルを選択</span>
+              <span>mp3 / wav / m4a を選択</span>
             </div>
           </div>
         </div>
@@ -213,12 +229,23 @@ function downloadMerged() {
       </div>
 
       <!-- Result -->
-      <div v-if="mergedAudioUrl" class="result-section">
-        <h3>合成結果</h3>
-        <audio controls :src="mergedAudioUrl" class="audio-player"></audio>
-        <button class="btn btn-secondary" @click="downloadMerged">
-          ダウンロード ({{ mergedFileName }})
-        </button>
+      <div v-if="mergedOutputs.length > 0" class="result-section">
+        <div class="result-header">
+          <h3>合成結果</h3>
+          <span v-if="mergeTime !== null" class="time-badge">処理時間: {{ mergeTime }} 秒</span>
+        </div>
+        <div
+          v-for="output in mergedOutputs"
+          :key="output.filename"
+          class="output-item"
+          :class="{ 'output-item--multi': mergedOutputs.length > 1 }"
+        >
+          <span v-if="mergedOutputs.length > 1" class="format-label">{{ output.label }}</span>
+          <audio controls :src="output.url" class="audio-player"></audio>
+          <button class="btn btn-secondary" @click="downloadOutput(output)">
+            ダウンロード ({{ output.filename }})
+          </button>
+        </div>
       </div>
 
       <!-- Log -->
@@ -411,14 +438,56 @@ function downloadMerged() {
   border-radius: 12px;
 }
 
-.result-section h3 {
+.result-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.result-header h3 {
   font-size: 1rem;
-  margin-bottom: 12px;
+  margin: 0;
+}
+
+.time-badge {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #fff;
+  background: #0071e3;
+  padding: 3px 10px;
+  border-radius: 20px;
+}
+
+.output-item {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.output-item--multi {
+  padding: 14px;
+  background: #fff;
+  border-radius: 10px;
+  margin-bottom: 10px;
+}
+
+.output-item--multi:last-child {
+  margin-bottom: 0;
+}
+
+.format-label {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #0071e3;
+  background: #e8f0fe;
+  padding: 2px 10px;
+  border-radius: 20px;
+  align-self: flex-start;
 }
 
 .audio-player {
   width: 100%;
-  margin-bottom: 12px;
 }
 
 .log-section {
